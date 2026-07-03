@@ -357,8 +357,9 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 	tarReader := tar.NewReader(reader)
 	var topLevelDir string
 	var totalBytesWritten int64
+	var extractedFiles []string
+	isSystemLayout := false
 
-	// Global overwrite default config on automated script executions
 	globalOverwriteChoice := ""
 	if sourceURL != "" {
 		globalOverwriteChoice = "y"
@@ -374,10 +375,15 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 		}
 
 		if topLevelDir == "" {
-			cleaned := filepath.ToSlash(header.Name)
-			elements := bytes.Split([]byte(cleaned), []byte("/"))
-			if len(elements) > 0 && string(elements[0]) != "." {
-				topLevelDir = string(elements[0])
+			cleaned := filepath.Clean(header.Name)
+			cleaned = filepath.ToSlash(cleaned)
+			elements := strings.Split(cleaned, "/")
+			if len(elements) > 0 && elements[0] != "." && elements[0] != "" {
+				firstDir := elements[0]
+				if firstDir == "usr" || firstDir == "etc" || firstDir == "opt" || firstDir == "bin" {
+					isSystemLayout = true
+				}
+				topLevelDir = firstDir
 			}
 		}
 
@@ -410,6 +416,9 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 			totalBytesWritten += written
 			destinationFile.Close()
 
+			// Record the exact file written to protect scanner scope
+			extractedFiles = append(extractedFiles, targetPath)
+
 			fmt.Printf("\rExtracting: %d MB...", totalBytesWritten/(1024*1024))
 		}
 	}
@@ -417,7 +426,29 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 
 	if topLevelDir != "" {
 		appName := topLevelDir
-		if len(appName) > 4 && appName[len(appName)-4:] == "-x64" {
+
+		if isSystemLayout {
+			// Isolate the true binary name solely from our fresh payload paths
+			for _, p := range extractedFiles {
+				if strings.Contains(filepath.ToSlash(p), "/bin/") {
+					appName = filepath.Base(p)
+					break
+				}
+			}
+			// Pivot our target tree branch away from generic config directories like etc
+			if topLevelDir == "etc" {
+				for _, p := range extractedFiles {
+					cleanedP := filepath.ToSlash(filepath.Clean(p))
+					if strings.Contains(cleanedP, "/usr/") {
+						topLevelDir = "usr"
+						break
+					} else if strings.Contains(cleanedP, "/opt/") {
+						topLevelDir = "opt"
+						break
+					}
+				}
+			}
+		} else if len(appName) > 4 && appName[len(appName)-4:] == "-x64" {
 			appName = appName[:len(appName)-4]
 		}
 
@@ -651,7 +682,12 @@ StartupNotify=true
 	shortcutDir := filepath.Join(homeDir, ".local", "share", "applications")
 	_ = os.MkdirAll(shortcutDir, 0755)
 
-	shortcutFile := filepath.Join(shortcutDir, fmt.Sprintf("%s.desktop", filepath.Base(dirPath)))
+	// Fallback naming handling for generic root system partitions
+	desktopName := filepath.Base(dirPath)
+	if desktopName == "usr" || desktopName == "opt" || desktopName == "etc" {
+		desktopName = appName
+	}
+	shortcutFile := filepath.Join(shortcutDir, fmt.Sprintf("%s.desktop", desktopName))
 
 	err = os.WriteFile(shortcutFile, []byte(desktopContent), 0755)
 	if err != nil {
