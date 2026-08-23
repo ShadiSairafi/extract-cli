@@ -14,9 +14,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/blakesmith/ar"           // Handles the .deb container
-	"github.com/klauspost/compress/zstd" // Blazing fast Zstd decompression
+	"github.com/klauspost/compress/zstd" // Fast Zstd decompression
 	"github.com/ulikunitz/xz"
 )
 
@@ -25,7 +26,7 @@ var (
 	zipMagic  = []byte{0x50, 0x4B, 0x03, 0x04}
 	gzipMagic = []byte{0x1F, 0x8B}
 	xzMagic   = []byte{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00}
-	zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}                   // Standard Zstd framing magic
+	zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 	debMagic  = []byte{0x21, 0x3C, 0x61, 0x72, 0x63, 0x68, 0x3E} // "!<arch>" string
 	tarMagic  = []byte{0x75, 0x73, 0x74, 0x61, 0x72}
 )
@@ -391,8 +392,17 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			os.MkdirAll(targetPath, os.FileMode(header.Mode))
-		case tar.TypeReg:
+			_ = os.MkdirAll(targetPath, 0755)
+			_ = os.Chmod(targetPath, os.FileMode(header.Mode)|0755)
+
+		case tar.TypeSymlink:
+			_ = os.MkdirAll(filepath.Dir(targetPath), 0755)
+			_ = os.Remove(targetPath)
+			if err := os.Symlink(header.Linkname, targetPath); err != nil {
+				fmt.Printf("Error creating symlink %s: %v\n", targetPath, err)
+			}
+
+		case tar.TypeReg, tar.TypeRegA:
 			if _, statErr := os.Stat(targetPath); statErr == nil {
 				if globalOverwriteChoice == "" {
 					fmt.Print("\r\033[K")
@@ -408,7 +418,7 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 
 			_ = os.MkdirAll(filepath.Dir(targetPath), 0755)
 
-			destinationFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.FileMode(header.Mode))
+			destinationFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 			if err != nil {
 				continue
 			}
@@ -416,9 +426,15 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 			totalBytesWritten += written
 			destinationFile.Close()
 
-			// Record the exact file written to protect scanner scope
-			extractedFiles = append(extractedFiles, targetPath)
+			// Restore POSIX permissions directly to bypass local umask restrictions
+			mode := os.FileMode(header.Mode)
+			if mode&0111 != 0 {
+				_ = os.Chmod(targetPath, mode|0755)
+			} else {
+				_ = os.Chmod(targetPath, mode|0644)
+			}
 
+			extractedFiles = append(extractedFiles, targetPath)
 			fmt.Printf("\rExtracting: %d MB...", totalBytesWritten/(1024*1024))
 		}
 	}
@@ -428,14 +444,12 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 		appName := topLevelDir
 
 		if isSystemLayout {
-			// Isolate the true binary name solely from our fresh payload paths
 			for _, p := range extractedFiles {
 				if strings.Contains(filepath.ToSlash(p), "/bin/") {
 					appName = filepath.Base(p)
 					break
 				}
 			}
-			// Pivot our target tree branch away from generic config directories like etc
 			if topLevelDir == "etc" {
 				for _, p := range extractedFiles {
 					cleanedP := filepath.ToSlash(filepath.Clean(p))
@@ -448,7 +462,7 @@ func runTarExtraction(reader io.Reader, destDir string, sourceURL string, format
 					}
 				}
 			}
-		} else if len(appName) > 4 && appName[len(appName)-4:] == "-x64" {
+		} else if len(appName) > 4 && strings.HasSuffix(strings.ToLower(appName), "-x64") {
 			appName = appName[:len(appName)-4]
 		}
 
@@ -497,7 +511,7 @@ func extractZip(path string, destDir string, sourceURL string) {
 		targetPath := filepath.Join(destDir, filepath.Clean(file.Name))
 
 		if file.FileInfo().IsDir() {
-			os.MkdirAll(targetPath, file.Mode())
+			_ = os.MkdirAll(targetPath, 0755)
 			continue
 		}
 
@@ -517,7 +531,7 @@ func extractZip(path string, destDir string, sourceURL string) {
 
 		_ = os.MkdirAll(filepath.Dir(targetPath), 0755)
 
-		destinationFile, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		destinationFile, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
 			fmt.Printf("Error writing file %s: %v\n", targetPath, err)
 			continue
@@ -528,16 +542,23 @@ func extractZip(path string, destDir string, sourceURL string) {
 			written, _ := io.Copy(destinationFile, zippedFile)
 			currentBytes += written
 			zippedFile.Close()
-
 			printProgressBar(currentBytes, totalBytes)
 		}
 		destinationFile.Close()
+
+		// Preserve POSIX execution permissions from ZIP mode
+		mode := file.Mode()
+		if mode&0111 != 0 {
+			_ = os.Chmod(targetPath, mode|0755)
+		} else {
+			_ = os.Chmod(targetPath, mode|0644)
+		}
 	}
 	fmt.Println("\nExtraction complete.")
 
 	if topLevelDir != "" {
 		appName := topLevelDir
-		if len(appName) > 4 && appName[len(appName)-4:] == "-x64" {
+		if len(appName) > 4 && strings.HasSuffix(strings.ToLower(appName), "-x64") {
 			appName = appName[:len(appName)-4]
 		}
 
@@ -614,8 +635,46 @@ func runCleanUninstall(targetDirName string) {
 }
 
 // -----------------------------------------------------------------
-// SYSTEM SHORTCUT SERVICE
+// SYSTEM SHORTCUT SERVICE & SANDBOX DETECTOR
 // -----------------------------------------------------------------
+
+// evaluates whether the binary requires --no-sandbox
+func evaluateSandboxRequirement(dirPath string) bool {
+	var sandboxPath string
+
+	_ = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if filepath.Base(path) == "chrome-sandbox" {
+			sandboxPath = path
+			return io.EOF // Found helper binary
+		}
+		return nil
+	})
+
+	// If no chrome-sandbox exists, standard execution applies
+	if sandboxPath == "" {
+		return false
+	}
+
+	info, err := os.Stat(sandboxPath)
+	if err != nil {
+		return true
+	}
+
+	// Must have SUID bit (04000)
+	hasSetUID := (info.Mode() & os.ModeSetuid) != 0
+
+	// Must be owned by root (UID 0)
+	isRootOwned := false
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		isRootOwned = (stat.Uid == 0)
+	}
+
+	// If present but misconfigured (not root-owned or no SUID), --no-sandbox is required
+	return !(isRootOwned && hasSetUID)
+}
 
 func createLinuxShortcut(appName string, dirPath string) {
 	absDir, err := filepath.Abs(dirPath)
@@ -626,24 +685,35 @@ func createLinuxShortcut(appName string, dirPath string) {
 
 	var execPath string
 	var iconPath string
-	isElectronApp := false
+
+	ignoredBinaries := map[string]bool{
+		"chrome-sandbox":          true,
+		"chrome_crashpad_handler": true,
+		"crashpad_handler":        true,
+		"language_server":         true,
+		"webm_encoder":            true,
+	}
 
 	_ = filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
+
+		baseName := filepath.Base(path)
+
 		if !info.IsDir() && (info.Mode()&0111 != 0) {
-			if execPath == "" || filepath.Base(path) == appName {
-				execPath = path
+			if !ignoredBinaries[baseName] {
+				if strings.EqualFold(baseName, appName) {
+					execPath = path
+				} else if execPath == "" && filepath.Dir(path) == absDir {
+					execPath = path
+				}
 			}
-		}
-		if filepath.Base(path) == "chrome-sandbox" {
-			isElectronApp = true
 		}
 
 		ext := filepath.Ext(path)
 		if ext == ".png" || ext == ".svg" {
-			if iconPath == "" || bytes.Contains([]byte(path), []byte("icon")) || bytes.Contains([]byte(path), []byte("resources")) {
+			if iconPath == "" || strings.Contains(path, "icon") || strings.Contains(path, "resources") {
 				iconPath = path
 			}
 		}
@@ -658,12 +728,14 @@ func createLinuxShortcut(appName string, dirPath string) {
 		return
 	}
 
+	// Intelligently check if sandbox helper is valid or requires fallback flag
+	needsNoSandbox := evaluateSandboxRequirement(absDir)
+
 	var execStr string
-	if isElectronApp {
-		binaryName := filepath.Base(execPath)
-		execStr = fmt.Sprintf("bash -c \"pkill -9 -x '%s' 2>/dev/null; '%s' --no-sandbox\"", binaryName, execPath)
+	if needsNoSandbox {
+		execStr = fmt.Sprintf(`"%s" --no-sandbox %%U`, execPath)
 	} else {
-		execStr = fmt.Sprintf(`"%s"`, execPath)
+		execStr = fmt.Sprintf(`"%s" %%U`, execPath)
 	}
 
 	desktopContent := fmt.Sprintf(`[Desktop Entry]
@@ -676,13 +748,13 @@ Icon=%s
 Terminal=false
 Categories=Utility;Development;
 StartupNotify=true
-`, appName, execStr, absDir, iconPath)
+MimeType=x-scheme-handler/%s;
+`, appName, execStr, absDir, iconPath, strings.ToLower(appName))
 
 	homeDir, _ := os.UserHomeDir()
 	shortcutDir := filepath.Join(homeDir, ".local", "share", "applications")
 	_ = os.MkdirAll(shortcutDir, 0755)
 
-	// Fallback naming handling for generic root system partitions
 	desktopName := filepath.Base(dirPath)
 	if desktopName == "usr" || desktopName == "opt" || desktopName == "etc" {
 		desktopName = appName
